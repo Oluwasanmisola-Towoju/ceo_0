@@ -1,110 +1,85 @@
+// single shared pg Pool for the whole process
+require('dotenv').config();
+const { Pool } = require('pg');
 
-// central place that knows which status transitions are legal
-const { query, withTransaction } = require('../db/pool');
-
-const ALLOWED_TRANSITIONS = {
-  new:      ['enriched', 'failed', 'skipped'],
-  enriched: ['drafted', 'failed', 'skipped'],
-  drafted:  ['approved', 'failed', 'skipped'],
-  approved: ['sent', 'failed', 'skipped'],
-  sent:     ['replied', 'bounced'],
-  replied:  [],
-  bounced:  [],
-  failed:   ['new'],     // allow manual/automated retry from the top
-  skipped:  ['new'],
-};
-
-class InvalidTransitionError extends Error {
-  constructor(from, to) {
-    super(`[stateMachine] Illegal transition: ${from} -> ${to}`);
-    this.name = 'InvalidTransitionError';
-    this.from = from;
-    this.to = to;
+const requiredEnv = ['DATABASE_URL'];
+for (const key of requiredEnv) {
+  if (!process.env[key]) {
+    throw new Error(`[db/pool] Missing required env var: ${key}`);
   }
 }
 
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: Number(process.env.PGPOOL_MAX || 10),
+  idleTimeoutMillis: Number(process.env.PGPOOL_IDLE_TIMEOUT_MS || 30000),
+  connectionTimeoutMillis: Number(process.env.PGPOOL_CONN_TIMEOUT_MS || 5000),
+});
+
+// surface pool-level letting them crash silently
+pool.on('error', (err) => {
+  console.error('[db/pool] Unexpected error on idle client', err);
+});
+
 /**
- * move a prospect to a new status, validating the transition first.
- * optionally applies extra column updates (e.g. drafted copy) in the same
- * statement, so the status change and its payload commit atomically.
- *
- * @param {string} prospectId
- * @param {string} toStatus
- * @param {object} [fields]  extra columns to set alongside the status, e.g.
- *                           { email_body: '...', subject_line_1: '...' }
+ * run a single query against the pool. Prefer this for one-off statements —
+ * it automatically acquires and releases a client.
+ * @param {string} text
+ * @param {Array<any>} [params]
  */
-async function transition(prospectId, toStatus, fields = {}) {
-  return withTransaction(async (client) => {
-    const { rows } = await client.query(
-      'SELECT status FROM prospects WHERE id = $1 FOR UPDATE',
-      [prospectId]
-    );
-    if (rows.length === 0) {
-      throw new Error(`[stateMachine] Prospect not found: ${prospectId}`);
-    }
 
-    const fromStatus = rows[0].status;
-    const allowed = ALLOWED_TRANSITIONS[fromStatus] || [];
-    if (!allowed.includes(toStatus)) {
-      throw new InvalidTransitionError(fromStatus, toStatus);
-    }
-
-    const setCols = ['status = $1'];
-    const values = [toStatus];
-    let i = 2;
-    for (const [col, val] of Object.entries(fields)) {
-      setCols.push(`${col} = $${i}`);
-      values.push(val);
-      i += 1;
-    }
-    values.push(prospectId);
-
-    const sql = `UPDATE prospects SET ${setCols.join(', ')} WHERE id = $${i} RETURNING *`;
-    const result = await client.query(sql, values);
-    return result.rows[0];
-  });
+async function query(text, params) {
+  const start = Date.now();
+  const result = await pool.query(text, params);
+  if (process.env.DEBUG_SQL) {
+    console.log('[db/pool] query', { text, ms: Date.now() - start, rows: result.rowCount });
+  }
+  return result;
 }
 
-// fetch a batch of prospects sitting in a given status, oldest first
-async function claimBatch(status, limit = 25) {
-  const { rows } = await query(
-    `SELECT * FROM prospects WHERE status = $1 ORDER BY status_updated_at ASC LIMIT $2`,
-    [status, limit]
-  );
-  return rows;
+//  acquire a dedicated client for a multi-statement transaction
+async function getClient() {
+  const client = await pool.connect();
+  const release = client.release.bind(client);
+
+  // guard against a caller forgetting to release: warn after 5s held
+  const timeout = setTimeout(() => {
+    console.warn('[db/pool] A client has been checked out for >5s — possible leak.');
+  }, 5000);
+
+  client.release = () => {
+    clearTimeout(timeout);
+    client.release = release;
+    return release();
+  };
+
+  return client;
 }
 
-// mark a prospect failed with an error message, incrementing retry_count.
-async function markFailed(prospectId, errorMessage) {
-  return withTransaction(async (client) => {
-    await client.query(
-      `UPDATE prospects
-         SET status = 'failed', last_error = $1, retry_count = retry_count + 1
-       WHERE id = $2`,
-      [errorMessage, prospectId]
-    );
-  });
+/**
+ * Safely run a callback inside a BEGIN/COMMIT transaction. Rolls back and
+ * re-throws on any error, and always releases the client.
+ * @param {(client: import('pg').PoolClient) => Promise<any>} fn
+ */
+
+async function withTransaction(fn) {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-// update columns on a prospect WITHOUT changing its pipeline status
-async function updateFields(prospectId, fields = {}) {
-  const cols = Object.keys(fields);
-  if (cols.length === 0) return null;
-
-  const setCols = cols.map((col, i) => `${col} = $${i + 1}`);
-  const values = cols.map((col) => fields[col]);
-  values.push(prospectId);
-
-  const sql = `UPDATE prospects SET ${setCols.join(', ')} WHERE id = $${cols.length + 1} RETURNING *`;
-  const { rows } = await query(sql, values);
-  return rows[0];
+// graceful shutdown — call from process signal handlers
+async function closePool() {
+  await pool.end();
 }
 
-module.exports = {
-  transition,
-  claimBatch,
-  markFailed,
-  updateFields,
-  InvalidTransitionError,
-  ALLOWED_TRANSITIONS,
-};
+module.exports = { pool, query, getClient, withTransaction, closePool };
